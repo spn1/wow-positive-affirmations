@@ -1,5 +1,5 @@
 ## Interface: 110002
-## Title: _Positive Affirmations
+## Title: Positive Affirmations
 ## Notes: Porivdes positive affirmations when things go wrong in dungeons
 ## Version: 0.1
 core.lua
