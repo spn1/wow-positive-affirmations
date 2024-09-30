@@ -1,13 +1,4 @@
-print("Positive Affirmations Loaded")
-print('GetNumGroupMembers: ', GetNumGroupMembers())
-
-local function DebugEvent()
-  local _, event, _, _, _, _, _, destGUID, destName = CombatLogGetCurrentEventInfo()
-  print()
-  print('[Event=', event,']')
-  print('GetNumGroupMembers: ', GetNumGroupMembers())
-  print('DEST NAME: ', destName, ' - ', UnitInParty(destName) or UnitInRaid(destName))
-end
+local isPlayingAffirmation = false
 
 local function isPartyOrRaidMember(destName)
   return UnitInParty(destName) or UnitInRaid(destName)
@@ -18,8 +9,7 @@ local function IsPartyMemberDeath(event, destName)
 end
 
 local function PlayAffirmation()
-  local playing = PlaySoundFile("Interface\\AddOns\\_PositiveAffirmations\\sfx\\test_1.mp3", "SFX")
-  print("Playing Affirmation - ", playing)
+  local playing = PlaySoundFile("Interface\\AddOns\\PositiveAffirmations\\sfx\\test_1.mp3", "MASTER")
 end
 
 local EventFrame = CreateFrame("frame", "EventFrame")
