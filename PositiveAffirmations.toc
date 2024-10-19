@@ -1,5 +1,8 @@
 ## Interface: 110002
 ## Title: Positive Affirmations
-## Notes: Porivdes positive affirmations when things go wrong in dungeons
+## Notes: Provides positive affirmations when things go wrong in Dungeons & Raids
 ## Version: 0.1
+
+embeds.xml
+
 core.lua
