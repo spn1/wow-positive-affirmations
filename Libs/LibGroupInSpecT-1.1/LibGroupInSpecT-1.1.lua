@@ -28,8 +28,18 @@
 --   .spec_group -- active spec group (1/2/nil)
 --   .talents = {
 --     [<talent_id>] = {
---       .tier
---       .column
+--       .rank
+--       .max_ranks
+--       .name_localized
+--       .icon
+--       .node_id
+--       .talent_id
+--       .spell_id
+--     }
+--     ...
+--   }
+--   .pvp_talents = {
+--     [<talent_id>] = {
 --       .name_localized
 --       .icon
 --       .talent_id
@@ -37,17 +47,6 @@
 --     }
 --     ...
 --   }
---   .glyphs = {
---     [<spell_id>] = {
---       .idx -- 1 to NUM_GLYPH_SLOTS
---       .glyph_id
---       .glyph_type
---       .name_localized
---       .icon
---       .spell_id
---     }
---     ...
---   },
 --   .lku -- last known unit id
 --   .not_visible
 --
@@ -73,7 +72,7 @@
 --     Returns an array with the set of unit ids for the current group.
 --]]
 
-local MAJOR, MINOR = "LibGroupInSpecT-1.1", tonumber (("$Revision: 78 $"):match ("(%d+)") or 0)
+local MAJOR, MINOR = "LibGroupInSpecT-1.1", 97
 
 if not LibStub then error(MAJOR.." requires LibStub") end
 local lib = LibStub:NewLibrary (MAJOR, MINOR)
@@ -86,9 +85,10 @@ if not lib.events then error(MAJOR.." requires CallbackHandler") end
 local UPDATE_EVENT = "GroupInSpecT_Update"
 local REMOVE_EVENT = "GroupInSpecT_Remove"
 local INSPECT_READY_EVENT = "GroupInSpecT_InspectReady"
+local QUEUE_EVENT = "GroupInSpecT_QueueChanged"
 
 local COMMS_PREFIX = "LGIST11"
-local COMMS_FMT = "0"
+local COMMS_FMT = "3"
 local COMMS_DELIM = "\a"
 
 local INSPECT_DELAY = 1.5
@@ -97,10 +97,10 @@ local INSPECT_TIMEOUT = 10 -- If we get no notification within 10s, give up on u
 local MAX_ATTEMPTS = 2
 
 --[===[@debug@
-lib.debug = true
+lib.debug = false
 local function debug (...)
   if lib.debug then  -- allow programmatic override of debug output by client addons
-    print (...) 
+    print (...)
   end
 end
 --@end-debug@]===]
@@ -156,24 +156,24 @@ function lib:NotifyInspect(unit)
   self.state.last_inspect = GetTime()
 end
 
-
+-- luacheck: globals InspectFrame NotifyInspect
 -- Get local handles on the key API functions
 local CanInspect                      = _G.CanInspect
 local ClearInspectPlayer              = _G.ClearInspectPlayer
 local GetClassInfo                    = _G.GetClassInfo
-local GetGlyphSocketInfo              = _G.GetGlyphSocketInfo
 local GetNumSubgroupMembers           = _G.GetNumSubgroupMembers
 local GetNumSpecializationsForClassID = _G.GetNumSpecializationsForClassID
 local GetPlayerInfoByGUID             = _G.GetPlayerInfoByGUID
+local GetInspectSelectedPvpTalent     = _G.C_SpecializationInfo.GetInspectSelectedPvpTalent
 local GetInspectSpecialization        = _G.GetInspectSpecialization
 local GetSpecialization               = _G.GetSpecialization
 local GetSpecializationInfo           = _G.GetSpecializationInfo
 local GetSpecializationInfoForClassID = _G.GetSpecializationInfoForClassID
 local GetSpecializationRoleByID       = _G.GetSpecializationRoleByID
-local GetSpellInfo                    = _G.GetSpellInfo
-local GetTalentInfo                   = _G.GetTalentInfo
+local GetPvpTalentInfoByID            = _G.GetPvpTalentInfoByID
+local GetPvpTalentSlotInfo            = _G.C_SpecializationInfo.GetPvpTalentSlotInfo
 local IsInRaid                        = _G.IsInRaid
---local NotifyInspect                   = _G.NotifyInspect -- Don't cache, as to avoid missing future hooks
+-- local NotifyInspect                = _G.NotifyInspect -- Don't cache, as to avoid missing future hooks
 local GetNumClasses                   = _G.GetNumClasses
 local UnitExists                      = _G.UnitExists
 local UnitGUID                        = _G.UnitGUID
@@ -183,22 +183,34 @@ local UnitIsConnected                 = _G.UnitIsConnected
 local UnitIsPlayer                    = _G.UnitIsPlayer
 local UnitIsUnit                      = _G.UnitIsUnit
 local UnitName                        = _G.UnitName
+local UnitTokenFromGUID               = _G.UnitTokenFromGUID
+local SendAddonMessage                = _G.C_ChatInfo.SendAddonMessage
+local RegisterAddonMessagePrefix      = _G.C_ChatInfo.RegisterAddonMessagePrefix
+local C_ClassTalents                  = _G.C_ClassTalents
+local C_Traits                        = _G.C_Traits
 
+local NUM_PVP_TALENT_SLOTS            = 3
 
 local global_spec_id_roles_detailed = {
   -- Death Knight
   [250] = "tank", -- Blood
   [251] = "melee", -- Frost
   [252] = "melee", -- Unholy
+  -- Demon Hunter
+  [577] = "melee", -- Havoc
+  [581] = "tank", -- Vengeance
   -- Druid
   [102] = "ranged", -- Balance
   [103] = "melee", -- Feral
   [104] = "tank", -- Guardian
   [105] = "healer", -- Restoration
+  -- Evoker
+  [1467] = "ranged", -- Devastation
+  [1468] = "healer", -- Preservation
   -- Hunter
   [253] = "ranged", -- Beast Mastery
   [254] = "ranged", -- Marksmanship
-  [255] = "ranged", -- Survival
+  [255] = "melee", -- Survival
   -- Mage
   [62] = "ranged", -- Arcane
   [63] = "ranged", -- Fire
@@ -241,24 +253,10 @@ local class_fixed_roles = {
 }
 
 local class_fixed_roles_detailed = {
-  HUNTER = "ranged",
   MAGE = "ranged",
   ROGUE = "melee",
   WARLOCK = "ranged",
 }
-
-local warrior_protection_spec_id = 73
-local warrior_anger_management_talent = 21204
-local warrior_ravager_talent = 21205
-local warrior_gladiators_resolve_talent = 21206
-local warrior_gladiator_stance = GetSpellInfo(156291)
-
-local function HasGladiatorStance (unit, info)
-  -- Check for "not the other two level-100 talents" in case talent info isn't ready.
-  local talents = info.talents
-  return talents and (talents[warrior_gladiators_resolve_talent] or (not talents[warrior_anger_management_talent] and not talents[warrior_ravager_talent])) and UnitBuff(unit, warrior_gladiator_stance)
-end
-
 
 -- Inspects only work after being fully logged in, so track that
 function lib:PLAYER_LOGIN ()
@@ -275,8 +273,6 @@ function lib:PLAYER_LOGIN ()
   frame:RegisterEvent ("UNIT_SPELLCAST_SUCCEEDED")
   frame:RegisterEvent ("UNIT_NAME_UPDATE")
   frame:RegisterEvent ("UNIT_AURA")
-  frame:RegisterEvent ("GLYPH_ADDED")
-  frame:RegisterEvent ("GLYPH_REMOVED")
   frame:RegisterEvent ("CHAT_MSG_ADDON")
   RegisterAddonMessagePrefix (COMMS_PREFIX)
 
@@ -321,44 +317,61 @@ end
 
 -- Caches to deal with API shortcomings as well as performance
 lib.static_cache.global_specs = {}           -- [gspec]         -> { .idx, .name_localized, .description, .icon, .background, .role }
-lib.static_cache.glyph_info = {}             -- [spell_id]      -> { .idx, .name_localized, .icon, .glyph_type, .glyph_id }
 lib.static_cache.class_to_class_id = {}      -- [CLASS]         -> class_id
 
 -- The talents cache can no longer be pre-fetched on login, but is now constructed class-by-class as we inspect people.
--- This probably means we want to only ever access it through the GetCachedTalentInfo() helper function below.
-lib.static_cache.talents = {}                -- [talent_id]      -> { .spell_id, .talent_id, .name_localized, .icon, .tier, .column }
+-- This probably means we want to only ever access it through the GetCachedTalentInfoByID() helper function below.
+lib.static_cache.talents = {}                -- [talent_id]      -> { .spell_id, .talent_id, .name_localized, .icon, .max_ranks, .rank }
+lib.static_cache.pvp_talents = {}            -- [talent_id]      -> { .spell_id, .talent_id, .name_localized, .icon }
 
--- Dridzt: I'd love another way but none of the GetTalent* functions return spellID, GetTalentLink() and parsing the link gives talentID that's not related to spellID as well
--- A quick tooltip scan is cheap though so elegance aside this is a good workaround considering this only runs once
-local tip = CreateFrame ("GameTooltip", MAJOR.."ScanTip", nil, "GameTooltipTemplate")
-tip:SetOwner (UIParent, "ANCHOR_NONE")
-
-function lib:GetCachedTalentInfo (class_id, tier, col, group, is_inspect, unit)
+function lib:GetCachedTalentInfoByID(talent_id, config_id)
+  if not talent_id then return nil end
   local talents = self.static_cache.talents
-  local talent_id, name, icon, sel, avail = GetTalentInfo (tier, col, group, is_inspect, unit)
-  if not talent_id or not class_id then
-    --[===[@debug@
-    debug ("GetCachedTalentInfo("..tostring(class_id)..","..tier..","..col..","..group..","..tostring(is_inspect)..","..tostring(unit)..") returned nil") --@end-debug@]===]
-    return {}
+  local talent = talents[talent_id]
+  if not talent then
+    local entry = C_Traits.GetEntryInfo(config_id or -3, talent_id)
+    if not entry then
+      --[===[@debug@
+      debug("GetCachedTalentInfoByID(" .. tostring(talent_id) .. "," .. tostring(config_id) .. ") returned nil") --@end-debug@]===]
+      return nil
+    end
+    if entry.definitionID then
+      local definition = C_Traits.GetDefinitionInfo(entry.definitionID)
+      talent = {
+        talent_id = talent_id,
+        spell_id = definition.spellID,
+        name_localized = TalentUtil.GetTalentNameFromInfo(definition),
+        icon = TalentButtonUtil.CalculateIconTexture(definition, definition.spellID),
+        max_ranks = entry.maxRanks,
+      }
+      -- talents[talent_id] = talent -- don't actually cache.
+    end
   end
-  talents[class_id] = talents[class_id] or {}
-  local class_talents = talents[class_id]
-  if not class_talents[talent_id] then
-    tip:ClearLines ()
-    tip:SetTalent (talent_id, is_inspect, group)
-    local _, _,spell_id = tip:GetSpell ()
-    class_talents[talent_id] = {
-      spell_id = spell_id,
-      talent_id = talent_id,
-      name_localized = name,
-      icon = icon,
-      tier = tier,
-      column = col,
-    }
-  end
-  return class_talents[talent_id], sel
+  return talent
 end
 
+function lib:GetCachedPvpTalentInfoByID (talent_id)
+  if not talent_id then return nil end
+  local pvp_talents = self.static_cache.pvp_talents
+  local talent = pvp_talents[talent_id]
+  if not talent then
+    local _, name, icon, _, _, spell_id = GetPvpTalentInfoByID (talent_id)
+    if not name then
+      --[===[@debug@
+      debug ("GetCachedPvpTalentInfo("..tostring(talent_id)..") returned nil") --@end-debug@]===]
+      return nil
+    end
+
+    talent = {
+      talent_id = talent_id,
+      spell_id = spell_id,
+      name_localized = name,
+      icon = icon,
+    }
+    -- pvp_talents[talent_id] = talent -- don't actually cache.
+  end
+  return talent
+end
 
 function lib:CacheGameData ()
   local gspecs = self.static_cache.global_specs
@@ -384,14 +397,15 @@ end
 
 function lib:GuidToUnit (guid)
   local info = self.cache[guid]
-  if info and info.lku and UnitGUID (info.lku) == guid then return info.lku end
-
-  for i,unit in ipairs (self:GroupUnits ()) do
-    if UnitExists (unit) and UnitGUID (unit) == guid then
-      if info then info.lku = unit end
-      return unit
-    end
+  if info and info.lku and UnitGUID(info.lku) == guid then
+    return info.lku
   end
+
+  local unit = UnitTokenFromGUID(guid)
+  if info then
+    info.lku = unit
+  end
+  return unit
 end
 
 
@@ -410,6 +424,7 @@ function lib:Query (unit)
     mainq[guid] = 1
     staleq[guid] = nil
     self.frame:Show () -- Start timer if not already running
+    self.events:Fire (QUEUE_EVENT)
   end
 end
 
@@ -422,6 +437,7 @@ function lib:Refresh (unit)
   if not self.state.mainq[guid] then
     self.state.staleq[guid] = 1
     self.frame:Show ()
+    self.events:Fire (QUEUE_EVENT)
   end
 end
 
@@ -490,16 +506,17 @@ function lib:ProcessQueues ()
   if not next (mainq) and not next (staleq) and self.state.throttle == 0 and self.state.debounce_send_update <= 0 then
     frame:Hide() -- Cancel timer, nothing queued and no unthrottling to be done
   end
+  self.events:Fire (QUEUE_EVENT)
 end
 
 
 function lib:UpdatePlayerInfo (guid, unit, info)
   info.class_localized, info.class, info.race_localized, info.race, info.gender, info.name, info.realm = GetPlayerInfoByGUID (guid)
   local class = info.class
-  if info.realm and info.realm == "" then info.realm = nil end
-  info.class_id = class and self.static_cache.class_to_class_id[class]
-  if not info.spec_role then info.spec_role = class and class_fixed_roles[class] end
-  if not info.spec_role_detailed then info.spec_role_detailed = class and class_fixed_roles_detailed[class] end
+  if info.realm == "" then info.realm = nil end
+  info.class_id = self.static_cache.class_to_class_id[class]
+  if not info.spec_role then info.spec_role = class_fixed_roles[class] end
+  if not info.spec_role_detailed then info.spec_role_detailed = class_fixed_roles_detailed[class] end
   info.lku = unit
 end
 
@@ -519,17 +536,24 @@ function lib:BuildInfo (unit)
   if not class and not self.state.mainq[guid] then
     self.state.staleq[guid] = 1
     self.frame:Show ()
+    self.events:Fire (QUEUE_EVENT)
   end
 
   local is_inspect = not UnitIsUnit (unit, "player")
-  local spec = GetSpecialization ()
-  info.global_spec_id = is_inspect and GetInspectSpecialization (unit) or spec and GetSpecializationInfo (spec)
+
+  local gspec_id
+  if is_inspect then
+    gspec_id = GetInspectSpecialization(unit)
+  else
+    local spec = GetSpecialization()
+    gspec_id = spec and GetSpecializationInfo(spec)
+  end
 
   local gspecs = self.static_cache.global_specs
-  if not info.global_spec_id or not gspecs[info.global_spec_id] then -- not a valid spec_id
+  if not gspecs[gspec_id] then -- not a valid spec_id
     info.global_spec_id = nil
   else
-    local gspec_id = info.global_spec_id
+    info.global_spec_id = gspec_id
     local spec_info = gspecs[gspec_id]
     info.spec_index          = spec_info.idx
     info.spec_name_localized = spec_info.name_localized
@@ -540,52 +564,63 @@ function lib:BuildInfo (unit)
     info.spec_role_detailed  = global_spec_id_roles_detailed[gspec_id]
   end
 
-  -- Fix role if unit is a protection warrior in Gladiator Stance.
-  -- Check for "not the other two level-100 talents" in case talent info isn't ready.
-  if info.global_spec_id == warrior_protection_spec_id then
-    if HasGladiatorStance (unit, info) then
-      info.spec_role = "DAMAGER"
-      info.spec_role_detailed = "melee"
-    end
-  end
-
   if not info.spec_role then info.spec_role = class and class_fixed_roles[class] end
   if not info.spec_role_detailed then info.spec_role_detailed = class and class_fixed_roles_detailed[class] end
 
   info.talents = info.talents or {}
+  info.pvp_talents = info.pvp_talents or {}
 
-  -- If GetPlayerInfoByGUID didn't return the class, we can't do talents yet
-  if info.class_id then
+  -- Only scan talents when we have player data
+  if info.spec_index then
     info.spec_group = GetActiveSpecGroup (is_inspect)
-    wipe (info.talents) -- Due to spec-specific talents we might leave things in on a spec-change otherwise
-    for tier = 1, MAX_TALENT_TIERS do
-      for col = 1, NUM_TALENT_COLUMNS do
-        local talent, sel = self:GetCachedTalentInfo (info.class_id, tier, col, info.spec_group, is_inspect, unit)
-        if talent and talent.talent_id and sel then
-          info.talents[talent.talent_id] = talent
+
+    wipe (info.talents)
+    local config_id = is_inspect and -1 or C_ClassTalents.GetActiveConfigID()
+    if not config_id and gspec_id then
+      local config_list = C_ClassTalents.GetConfigIDsBySpecID(gspec_id)
+      config_id = config_list[1]
+    end
+    local config = config_id and C_Traits.GetConfigInfo(config_id)
+    if config then
+      local tree_id = config.treeIDs[1]
+      local node_list = C_Traits.GetTreeNodes(tree_id)
+      for _, node_id in ipairs(node_list) do
+        local node = C_Traits.GetNodeInfo(config_id, node_id)
+        local is_node_granted = node.activeRank - node.ranksPurchased > 0
+        local is_node_purchased = node.ranksPurchased > 0
+        if (is_node_granted or is_node_purchased) and (not node.subTreeID or node.subTreeActive) then
+          local entry_id = node.activeEntry.entryID
+          local talent = self:GetCachedTalentInfoByID(entry_id, config_id)
+          if talent then
+            talent.rank = is_node_granted and node.maxRanks or node.ranksPurchased
+            talent.node_id = node_id
+            info.talents[entry_id] = talent
+          end
+        end
+      end
+    end
+
+    wipe (info.pvp_talents)
+    if is_inspect then
+      for index = 1, NUM_PVP_TALENT_SLOTS do
+        local talent_id = GetInspectSelectedPvpTalent (unit, index)
+        if talent_id then
+          info.pvp_talents[talent_id] = self:GetCachedPvpTalentInfoByID (talent_id)
+        end
+      end
+    else
+      -- C_SpecializationInfo.GetAllSelectedPvpTalentIDs will sometimes return a lot of extra talents
+      for index = 1, NUM_PVP_TALENT_SLOTS do
+        local slot_info = GetPvpTalentSlotInfo (index)
+        local talent_id = slot_info and slot_info.selectedTalentID
+        if talent_id then
+          info.pvp_talents[talent_id] = self:GetCachedPvpTalentInfoByID (talent_id)
         end
       end
     end
   end
 
-  info.glyphs = wipe (info.glyphs or {})
-  local glyph_info = self.static_cache.glyph_info
-  for idx = 1,NUM_GLYPH_SLOTS do
-    local enabled, glyph_type, _, spell_id, icon, glyph_id = GetGlyphSocketInfo (idx, nil, is_inspect, unit)
-    if spell_id and not glyph_info[spell_id] then -- not already available in the cache
-      glyph_info[spell_id] = {}
-      local glyph = glyph_info[spell_id]
-      glyph.spell_id = spell_id
-      glyph.glyph_type = glyph_type
-      glyph.idx = idx
-      glyph.icon = icon
-      glyph.glyph_id = glyph_id
-      glyph.name_localized = spell_id and (GetSpellInfo (spell_id)) or nil
-    end
-    if enabled and spell_id then
-      info.glyphs[spell_id] = glyph_info[spell_id]
-    end
-  end
+  info.glyphs = info.glyphs or {} -- kept for addons that still refer to this
 
   if is_inspect and not UnitIsVisible (unit) and UnitIsConnected (unit) then info.not_visible = true end
 
@@ -619,10 +654,12 @@ function lib:INSPECT_READY (guid)
   if finalize then
     ClearInspectPlayer ()
   end
+  self.events:Fire (QUEUE_EVENT)
 end
 
 
 function lib:PLAYER_ENTERING_WORLD ()
+  self.state.debounce_send_update = 2.5 -- delay comm update after loading
   if self.commScope == "INSTANCE_CHAT" then
     -- Handle moving directly from one LFG to another
     self.commScope = nil
@@ -667,7 +704,7 @@ function lib:DoPlayerUpdate ()
   self.frame:Show ()
 end
 
-
+-- LibStub("LibGroupInSpecT-1.1"):SendLatestSpecData()
 function lib:SendLatestSpecData ()
   local scope = self.commScope
   if not scope then return end
@@ -676,30 +713,28 @@ function lib:SendLatestSpecData ()
   local info = self.cache[guid]
   if not info then return end
 
-  -- fmt, guid, global_spec_id, talent1 -> MAX_TALENT_TIERS, glyph1 -> NUM_GLYPH_SLOTS, glyph1 detail, glyph 2 detail,
-  -- sequentially, allow no gaps for missing talents/glyphs we decode by index on the receiving end.
-  local datastr = COMMS_FMT..COMMS_DELIM..guid..COMMS_DELIM..(info.global_spec_id or 0)
+  -- fmt, guid, global_spec_id, talents, pvptalent1 -> NUM_PVP_TALENT_SLOTS
+  local datastr = strjoin(COMMS_DELIM, COMMS_FMT, guid, info.global_spec_id or 0)
+
+  local talents = ""
+  local config_id = C_ClassTalents.GetActiveConfigID()
+  if not config_id and info.global_spec_id then
+    local config_list = C_ClassTalents.GetConfigIDsBySpecID(info.global_spec_id)
+    config_id = config_list[1]
+  end
+  if config_id then
+    talents = C_Traits.GenerateImportString(config_id) or ""
+  end
+  datastr = datastr..COMMS_DELIM..talents
+
   local talentCount = 1
-  for k in pairs(info.talents) do
+  for k in pairs(info.pvp_talents) do
     datastr = datastr..COMMS_DELIM..k
     talentCount = talentCount + 1
   end
-  for i=talentCount,MAX_TALENT_TIERS do
+  for i = talentCount, NUM_PVP_TALENT_SLOTS do
     datastr = datastr..COMMS_DELIM..0
   end
-
-  local glyphCount = 1
-  local glyphstr = ""
-  for k,glyph in pairs(info.glyphs) do -- specifically ordered because we pull them out by index on the other end
-    datastr = datastr..COMMS_DELIM..k
-    glyphstr = glyphstr..COMMS_DELIM..(glyph.idx or "")..COMMS_DELIM..(glyph.glyph_id or "")..COMMS_DELIM..(glyph.glyph_type or "")
-    glyphCount = glyphCount + 1
-  end
-  for i=glyphCount,NUM_GLYPH_SLOTS do
-    datastr = datastr..COMMS_DELIM..0
-    glyphstr = glyphstr..COMMS_DELIM..COMMS_DELIM..COMMS_DELIM -- unused entry, but keep format sound
-  end
-  datastr = datastr..glyphstr
 
   --[===[@debug@
   debug ("Sending LGIST update to "..scope) --@end-debug@]===]
@@ -718,29 +753,94 @@ end
 
 -- Indicies for various parts of the split data msg
 local msg_idx = {}
-msg_idx.fmt            = 1
-msg_idx.guid           = msg_idx.fmt + 1
-msg_idx.global_spec_id = msg_idx.guid + 1
-msg_idx.talents        = msg_idx.global_spec_id + 1
-msg_idx.glyphs         = msg_idx.talents + MAX_TALENT_TIERS
-msg_idx.glyph_detail   = msg_idx.glyphs + NUM_GLYPH_SLOTS
+msg_idx.fmt             = 1
+msg_idx.guid            = msg_idx.fmt + 1
+msg_idx.global_spec_id  = msg_idx.guid + 1
+msg_idx.talents         = msg_idx.global_spec_id + 1
+msg_idx.pvp_talents     = msg_idx.talents + 1
+msg_idx.end_pvp_talents = msg_idx.pvp_talents + NUM_PVP_TALENT_SLOTS - 1
+
+
+local function decode_talent_string(import_string, talents_table)
+  if not import_string or import_string == "" then
+    return false
+  end
+
+  -- Serialization Version 2
+  local import_stream = ExportUtil.MakeImportDataStream(import_string)
+
+  local header_bit_width = 8 + 16 + 128 -- version + spec_id + tree_hash
+  if import_stream:GetNumberOfBits() < header_bit_width then
+    return false
+  end
+
+  local serialization_version = import_stream:ExtractValue(8)
+  if serialization_version ~= 2 then -- bump to match C_Traits.GetLoadoutSerializationVersion()
+    return false
+  end
+
+  local spec_id = import_stream:ExtractValue(16)
+  import_stream:ExtractValue(128) -- tree_hash (16 * 8)
+
+  local config_id = -3 -- VIEW_TRAIT_CONFIG_ID
+  local tree_id = C_ClassTalents.GetTraitTreeForSpec(spec_id)
+  for _, node_id in ipairs(C_Traits.GetTreeNodes(tree_id)) do
+    if import_stream:ExtractValue(1) == 1 then -- isNodeSelected
+      local is_node_purchased = import_stream:ExtractValue(1) == 1
+      -- local is_node_granted = not is_node_purchased
+
+      local node = C_Traits.GetNodeInfo(config_id, node_id)
+      if not node then
+        --[===[@debug@
+        debug(_G.ERROR_COLOR:WrapTextInColorCode(("Error decoding talents (config:%s, tree:%s, node:%s)"):format(tostringall(config_id, tree_id, node_id)))) --@end-debug@]===]
+        wipe(talents_table)
+        return false
+      end
+      local entry_id = node.activeEntry and node.activeEntry.entryID
+      local rank = node.maxRanks -- is_node_granted and 1 or node.maxRanks
+
+      if is_node_purchased then
+        if import_stream:ExtractValue(1) == 1 then -- isPartiallyRankedValue
+          rank = import_stream:ExtractValue(6) -- bitWidthRanksPurchased
+        end
+        if import_stream:ExtractValue(1) == 1 then -- isChoiceNode
+          local choice_node_index = import_stream:ExtractValue(2) + 1 -- stored as zero-index
+          entry_id = node.entryIDs[choice_node_index]
+        end
+        if not entry_id then
+          entry_id = node.entryIDs[1]
+        end
+      end
+
+      local talent = lib:GetCachedTalentInfoByID(entry_id)
+      if talent then
+        talent.rank = rank
+        talents_table[entry_id] = talent
+      end
+    end
+  end
+
+  return true
+end
+
 
 function lib:CHAT_MSG_ADDON (prefix, datastr, scope, sender)
   if prefix ~= COMMS_PREFIX or scope ~= self.commScope then return end
-  --[===[@debug@
-  debug ("Incoming LGIST update from "..(scope or "nil").."/"..(sender or "nil")..": "..(datastr:gsub(COMMS_DELIM,";") or "nil")) --@end-debug@]===]
+  sender = Ambiguate(sender, "none")
 
-  local data = { strsplit (COMMS_DELIM,datastr) }
-  local fmt = data[msg_idx.fmt]
+  --[===[@debug@
+  debug(("Incoming LGIST update from %s/%s: %s"):format(tostringall(scope, sender, datastr:gsub(COMMS_DELIM, "#")))) --@end-debug@]===]
+
+  local fmt = strsplit(COMMS_DELIM, datastr, 1)
   if fmt ~= COMMS_FMT then return end -- Unknown format, ignore
 
+  local data = { strsplit(COMMS_DELIM, datastr) }
+
   local guid = data[msg_idx.guid]
+  if UnitGUID(sender) ~= guid then return end
 
-  local senderguid = UnitGUID(sender)
-  if senderguid and senderguid ~= guid then return end
-
-  local info = guid and self.cache[guid]
-  if not info then return end -- Never allow random message to create new group member entries!
+  local info = self.cache[guid]
+  if not info then return end
 
   local unit = self:GuidToUnit (guid)
   if not unit then return end
@@ -755,9 +855,8 @@ function lib:CHAT_MSG_ADDON (prefix, datastr, scope, sender)
   info.class_id = self.static_cache.class_to_class_id[info.class]
 
   local gspecs = self.static_cache.global_specs
-
-  local gspec_id           = data[msg_idx.global_spec_id] and tonumber (data[msg_idx.global_spec_id])
-  if not gspec_id or not gspecs[gspec_id] then return end -- Malformed message, avoid throwing errors by using this nil
+  local gspec_id = tonumber(data[msg_idx.global_spec_id])
+  if not gspecs[gspec_id] then return end -- Malformed message, avoid throwing errors by using this nil
 
   info.global_spec_id      = gspec_id
   info.spec_index          = gspecs[gspec_id].idx
@@ -768,56 +867,23 @@ function lib:CHAT_MSG_ADDON (prefix, datastr, scope, sender)
   info.spec_role           = gspecs[gspec_id].role
   info.spec_role_detailed  = global_spec_id_roles_detailed[gspec_id]
 
-  -- Fix role if unit is a protection warrior in Gladiator Stance.
-  -- Check for "not the other two level-100 talents" in case talent info isn't ready.
-  if info.global_spec_id == warrior_protection_spec_id then
-    if HasGladiatorStance (unit, info) then
-      info.spec_role = "DAMAGER"
-      info.spec_role_detailed = "melee"
-    end
-  end
+  local need_inspect = nil -- shouldn't be needed, but just in case
 
-  local need_inspect = nil
-  info.talents = wipe (info.talents or {})
-  local talents = self.static_cache.talents[info.class_id]
-  if talents then -- The group entry is created before we have inspect-data, so may not have cached talents yet
-    for i = msg_idx.talents, msg_idx.glyphs - 1 do
-      local talent_id = tonumber (data[i])
-      if talent_id and talent_id > 0 then
-        if talents[talent_id] then
-          info.talents[talent_id] = talents[talent_id]
-        else
-          -- While we had some talents for this class, we apparently didn't have all for this particular spec, so mark for inspect
-          need_inspect = 1
-        end
-      end
-    end
-  else
-    -- Talents weren't pre-cached, so mark for inspect
+  info.talents = wipe(info.talents or {})
+  if not decode_talent_string(data[msg_idx.talents], info.talents) then
     need_inspect = 1
   end
 
-  local glyph_info = self.static_cache.glyph_info
-  info.glyphs = wipe (info.glyphs or {})
-  for i = msg_idx.glyphs, msg_idx.glyph_detail - 1 do
-    local spell_id = tonumber (data[i])
-    if spell_id and spell_id > 0 then
-      if not glyph_info[spell_id] then -- not yet in cache, add it
-        glyph_info[spell_id] = {}
-        local glyph = glyph_info[spell_id]
-        glyph.spell_id = spell_id
-
-        local offs = (i - msg_idx.glyphs) * 3 -- glyph details come in 3s (idx,glyph_id,glyph_type) so offset our index
-        local start = msg_idx.glyph_detail
-        glyph.idx        = tonumber (data[start + offs])
-        glyph.glyph_id   = tonumber (data[start + offs + 1])
-        glyph.glyph_type = tonumber (data[start + offs + 2])
-
-        local name, _, icon = GetSpellInfo(spell_id)
-        glyph.name_localized = name
-        glyph.icon           = icon
+  info.pvp_talents = wipe(info.pvp_talents or {})
+  for i = msg_idx.pvp_talents, msg_idx.end_pvp_talents do
+    local talent_id = tonumber(data[i]) or 0
+    if talent_id > 0 then
+      local talent = self:GetCachedPvpTalentInfoByID(talent_id)
+      if talent then
+        info.pvp_talents[talent_id] = talent
+      else
+        need_inspect = 1
       end
-      info.glyphs[spell_id] = glyph_info[spell_id]
     end
   end
 
@@ -827,8 +893,9 @@ function lib:CHAT_MSG_ADDON (prefix, datastr, scope, sender)
   if need_inspect or want_inspect then self.frame:Show () end
 
   --[===[@debug@
-  debug ("Firing LGIST update event for unit "..unit..", GUID "..guid) --@end-debug@]===]
+  debug ("Firing LGIST update event for unit "..unit..", GUID "..guid..", inspect "..tostring(not not need_inspect)) --@end-debug@]===]
   self.events:Fire (UPDATE_EVENT, guid, unit, info)
+  self.events:Fire (QUEUE_EVENT)
 end
 
 
@@ -855,16 +922,6 @@ function lib:PLAYER_SPECIALIZATION_CHANGED (unit)
   if unit and UnitIsUnit (unit, "player") then
     self:DoPlayerUpdate ()
   end
-end
-
-
-function lib:GLYPH_ADDED ()
-  self:DoPlayerUpdate ()
-end
-
-
-function lib:GLYPH_REMOVED ()
-  self:DoPlayerUpdate ()
 end
 
 
@@ -896,6 +953,7 @@ function lib:UNIT_AURA (unit)
           if not self.state.mainq[guid] then
             self.state.staleq[guid] = 1
             self.frame:Show ()
+            self.events:Fire (QUEUE_EVENT)
           end
         end
       elseif UnitIsConnected (unit) then
@@ -907,30 +965,12 @@ function lib:UNIT_AURA (unit)
         info.not_visible = true
       end
     end
-
-    -- Fix role if unit is a protection warrior in Gladiator Stance.
-    -- Check for "not the other two level-100 talents" in case talent info isn't ready.
-    if info.global_spec_id == warrior_protection_spec_id then
-      if HasGladiatorStance (unit, info) then
-        if info.spec_role ~= "DAMAGER" then
-          info.spec_role = "DAMAGER"
-          info.spec_role_detailed = "melee"
-          self.events:Fire (UPDATE_EVENT, guid, unit, info)
-        end
-      elseif info.spec_role ~= "TANK" then
-        info.spec_role = "TANK"
-        info.spec_role_detailed = "tank"
-        self.events:Fire (UPDATE_EVENT, guid, unit, info)
-      end
-    end
   end
 end
 
 
-local dual_spec_spells = {}
-for i, spellid in ipairs (TALENT_ACTIVATION_SPELLS) do dual_spec_spells[spellid] = true end
-function lib:UNIT_SPELLCAST_SUCCEEDED (unit, spellname, rank, lineid, spellid)
-  if dual_spec_spells[spellid] then
+function lib:UNIT_SPELLCAST_SUCCEEDED (unit, _, spell_id)
+  if spell_id == 200749 then -- Activating Specialization
     self:Query (unit) -- Definitely changed, so high prio refresh
   end
 end
@@ -953,6 +993,11 @@ function lib:StaleInspections ()
     table.insert (q, guid)
   end
   return q
+end
+
+
+function lib:IsInspectQueued (guid)
+  return guid and ((self.state.mainq[guid] or self.state.staleq[guid]) and true)
 end
 
 
@@ -979,7 +1024,7 @@ function lib:Rescan (guid)
         if UnitIsUnit (unit, "player") then
           self.events:Fire (UPDATE_EVENT, UnitGUID("player"), "player", self:BuildInfo ("player"))
         else
-          local guid = UnitGUID (unit)
+          guid = UnitGUID (unit)
           if guid and not mainq[guid] then
             staleq[guid] = 1
           end
@@ -991,6 +1036,7 @@ function lib:Rescan (guid)
 
   -- Evict any stale entries
   self:GROUP_ROSTER_UPDATE ()
+  self.events:Fire (QUEUE_EVENT)
 end
 
 
